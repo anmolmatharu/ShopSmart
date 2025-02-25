@@ -52,5 +52,4 @@ Price drop alerts
 User authentication and saved comparisons
 Responsive design for all devices
 
-License
-MIT
+
