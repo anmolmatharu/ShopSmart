@@ -1,0 +1,1003 @@
+// services/alertService.js - Service for price alerts
+const PriceAlert = require('../models/PriceAlert');
+const User = require('../models/User');
+const Product = require('../models/Product');
+const ApiError = require('../utils/ApiError');
+const { sendAlertEmail } = require('./emailService');
+
+/**
+ * Create a new price alert
+ */
+const createPriceAlert = async (userId, productId, targetPrice) => {
+  try {
+    // Check if product exists
+    const product = await Product.findById(productId);
+    
+    if (!product) {
+      throw new ApiError(404, 'Product not found');
+    }
+    
+    // Check if user exists
+    const user = await User.findById(userId);
+    
+    if (!user) {
+      throw new ApiError(404, 'User not found');
+    }
+    
+    // Validate target price
+    if (targetPrice <= 0) {
+      throw new ApiError(400, 'Target price must be greater than zero');
+    }
+    
+    // Check if alert already exists
+    const existingAlert = await PriceAlert.findOne({
+      user: userId,
+      product: productId
+    });
+    
+    if (existingAlert) {
+      // Update existing alert
+      existingAlert.targetPrice = targetPrice;
+      existingAlert.isActive = true;
+      existingAlert.triggered = false;
+      await existingAlert.save();
+      return existingAlert;
+    }
+    
+    // Create new alert
+    const alert = new PriceAlert({
+      user: userId,
+      product: productId,
+      currentPrice: product.currentPrice,
+      targetPrice,
+      retailer: product.retailer
+    });
+    
+    await alert.save();
+    
+    // Add alert to user's alerts
+    user.priceAlerts.push(alert._id);
+    await user.save();
+    
+    return alert;
+  } catch (error) {
+    if (error instanceof ApiError) {
+      throw error;
+    }
+    throw new ApiError(500, 'Error creating price alert', error);
+  }
+};
+
+/**
+ * Get all active alerts for a user
+ */
+const getUserAlerts = async (userId) => {
+  try {
+    const alerts = await PriceAlert.find({ user: userId })
+      .populate('product', 'name imageUrl currentPrice retailer url')
+      .sort({ createdAt: -1 });
+    
+    return alerts;
+  } catch (error) {
+    throw new ApiError(500, 'Error fetching user alerts', error);
+  }
+};
+
+/**
+ * Delete a price alert
+ */
+const deleteAlert = async (alertId, userId) => {
+  try {
+    const alert = await PriceAlert.findById(alertId);
+    
+    if (!alert) {
+      throw new ApiError(404, 'Alert not found');
+    }
+    
+    // Ensure alert belongs to user
+    if (alert.user.toString() !== userId) {
+      throw new ApiError(403, 'Not authorized to delete this alert');
+    }
+    
+    // Remove alert from user's alerts
+    await User.findByIdAndUpdate(userId, {
+      $pull: { priceAlerts: alertId }
+    });
+    
+    // Delete the alert
+    await PriceAlert.findByIdAndRemove(alertId);
+    
+    return { success: true };
+  } catch (error) {
+    if (error instanceof ApiError) {
+      throw error;
+    }
+    throw new ApiError(500, 'Error deleting alert', error);
+  }
+};
+
+/**
+ * Check all active alerts and trigger notifications if price threshold is met
+ * This would be called by a scheduled job
+ */
+const processActiveAlerts = async () => {
+  try {
+    // Find all active alerts
+    const alerts = await PriceAlert.find({ 
+      isActive: true,
+      triggered: false
+    }).populate('product user');
+    
+    const triggeredAlerts = [];
+    
+    for (const alert of alerts) {
+      // Skip if product or user is missing
+      if (!alert.product || !alert.user) {
+        continue;
+      }
+      
+      // Check if current price is at or below target price
+      if (alert.product.currentPrice <= alert.targetPrice) {
+        // Update alert
+        alert.triggered = true;
+        alert.triggeredAt = new Date();
+        await alert.save();
+        
+        // Send notification email
+        await sendAlertEmail(
+          alert.user.email,
+          alert.user.profile.firstName,
+          alert.product.name,
+          alert.product.currentPrice,
+          alert.targetPrice,
+          alert.product.url
+        );
+        
+        triggeredAlerts.push(alert);
+      } else {
+        // Update current price
+        alert.currentPrice = alert.product.currentPrice;
+        await alert.save();
+      }
+    }
+    
+    return triggeredAlerts;
+  } catch (error) {
+    throw new ApiError(500, 'Error processing alerts', error);
+  }
+};
+
+module.exports = {
+  createPriceAlert,
+  getUserAlerts,
+  deleteAlert,
+  processActiveAlerts
+};
+
+// services/emailService.js - Service for email notifications
+const nodemailer = require('nodemailer');
+const ApiError = require('../utils/ApiError');
+
+// Create email transporter
+const transporter = nodemailer.createTransport({
+  host: process.env.EMAIL_HOST,
+  port: process.env.EMAIL_PORT,
+  secure: process.env.EMAIL_SECURE === 'true',
+  auth: {
+    user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_PASS
+  }
+});
+
+/**
+ * Send a welcome email to new users
+ */
+const sendWelcomeEmail = async (email, firstName) => {
+  try {
+    const mailOptions = {
+      from: `"ShopSmart" <${process.env.EMAIL_FROM}>`,
+      to: email,
+      subject: 'Welcome to ShopSmart!',
+      html: `
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+          <h2>Welcome to ShopSmart, ${firstName}!</h2>
+          <p>Thank you for joining ShopSmart, your ultimate tool for comparing products and finding the best deals.</p>
+          <p>With ShopSmart, you can:</p>
+          <ul>
+            <li>Compare products across multiple retailers</li>
+            <li>Track price history and get alerts when prices drop</li>
+            <li>Save your comparisons for future reference</li>
+            <li>Get detailed product specifications and reviews in one place</li>
+          </ul>
+          <p>Get started by searching for a product or browsing categories.</p>
+          <div style="margin: 30px 0; text-align: center;">
+            <a href="${process.env.FRONTEND_URL}" style="background-color: #3f51b5; color: white; padding: 10px 20px; text-decoration: none; border-radius: 4px;">Start Shopping Smarter</a>
+          </div>
+          <p>If you have any questions, just reply to this email. We're here to help!</p>
+          <p>Happy shopping!<br>The ShopSmart Team</p>
+        </div>
+      `
+    };
+    
+    await transporter.sendMail(mailOptions);
+  } catch (error) {
+    console.error('Error sending welcome email:', error);
+    // Don't throw an error, just log it - we don't want to interrupt user signup
+  }
+};
+
+/**
+ * Send price alert email
+ */
+const sendAlertEmail = async (email, firstName, productName, currentPrice, targetPrice, productUrl) => {
+  try {
+    const mailOptions = {
+      from: `"ShopSmart Price Alert" <${process.env.EMAIL_FROM}>`,
+      to: email,
+      subject: `Price Drop Alert: ${productName}`,
+      html: `
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+          <h2>Price Drop Alert!</h2>
+          <p>Hello ${firstName},</p>
+          <p>Good news! The price for <strong>${productName}</strong> has dropped to <strong>$${currentPrice.toFixed(2)}</strong>, which is at or below your target price of $${targetPrice.toFixed(2)}.</p>
+          <div style="margin: 30px 0; text-align: center;">
+            <a href="${productUrl}" style="background-color: #3f51b5; color: white; padding: 10px 20px; text-decoration: none; border-radius: 4px;">View Product</a>
+          </div>
+          <p>Don't miss out on this deal!</p>
+          <p>The ShopSmart Team</p>
+          <p style="font-size: 12px; color: #777;">You received this email because you set up a price alert on ShopSmart. <a href="${process.env.FRONTEND_URL}/settings/notifications">Manage your notification settings</a>.</p>
+        </div>
+      `
+    };
+    
+    await transporter.sendMail(mailOptions);
+    return true;
+  } catch (error) {
+    console.error('Error sending price alert email:', error);
+    return false;
+  }
+};
+
+/**
+ * Send password reset email
+ */
+const sendPasswordResetEmail = async (email, resetToken) => {
+  try {
+    const resetUrl = `${process.env.FRONTEND_URL}/reset-password/${resetToken}`;
+    
+    const mailOptions = {
+      from: `"ShopSmart Account" <${process.env.EMAIL_FROM}>`,
+      to: email,
+      subject: 'Password Reset Request',
+      html: `
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+          <h2>Reset Your Password</h2>
+          <p>You requested a password reset for your ShopSmart account.</p>
+          <p>Click the button below to reset your password. This link is valid for 1 hour.</p>
+          <div style="margin: 30px 0; text-align: center;">
+            <a href="${resetUrl}" style="background-color: #3f51b5; color: white; padding: 10px 20px; text-decoration: none; border-radius: 4px;">Reset Password</a>
+          </div>
+          <p>If you didn't request this, please ignore this email and your password will remain unchanged.</p>
+          <p>The ShopSmart Team</p>
+        </div>
+      `
+    };
+    
+    await transporter.sendMail(mailOptions);
+    return true;
+  } catch (error) {
+    console.error('Error sending password reset email:', error);
+    throw new ApiError(500, 'Error sending password reset email');
+  }
+};
+
+module.exports = {
+  sendWelcomeEmail,
+  sendAlertEmail,
+  sendPasswordResetEmail
+};
+
+// models/PriceAlert.js - MongoDB schema for price alerts
+const mongoose = require('mongoose');
+
+const PriceAlertSchema = new mongoose.Schema({
+  user: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    required: true
+  },
+  product: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Product',
+    required: true
+  },
+  targetPrice: {
+    type: Number,
+    required: true
+  },
+  currentPrice: {
+    type: Number,
+    required: true
+  },
+  retailer: {
+    type: String,
+    required: true
+  },
+  isActive: {
+    type: Boolean,
+    default: true
+  },
+  triggered: {
+    type: Boolean,
+    default: false
+  },
+  triggeredAt: {
+    type: Date
+  },
+  createdAt: {
+    type: Date,
+    default: Date.now
+  }
+});
+
+module.exports = mongoose.model('PriceAlert', PriceAlertSchema);
+
+// models/Review.js - MongoDB schema for product reviews
+const mongoose = require('mongoose');
+
+const ReviewSchema = new mongoose.Schema({
+  product: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Product',
+    required: true
+  },
+  user: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User'
+  },
+  externalId: {
+    type: String
+  },
+  externalSource: {
+    type: String
+  },
+  rating: {
+    type: Number,
+    required: true,
+    min: 1,
+    max: 5
+  },
+  title: {
+    type: String
+  },
+  content: {
+    type: String,
+    required: true
+  },
+  helpfulVotes: {
+    type: Number,
+    default: 0
+  },
+  verifiedPurchase: {
+    type: Boolean,
+    default: false
+  },
+  date: {
+    type: Date,
+    default: Date.now
+  }
+});
+
+// Index for quickly finding reviews for a product
+ReviewSchema.index({ product: 1, date: -1 });
+
+module.exports = mongoose.model('Review', ReviewSchema);
+
+// controllers/userController.js - Handler for user-related routes
+const User = require('../models/User');
+const crypto = require('crypto');
+const jwt = require('jsonwebtoken');
+const catchAsync = require('../utils/catchAsync');
+const ApiError = require('../utils/ApiError');
+const { sendWelcomeEmail, sendPasswordResetEmail } = require('../services/emailService');
+
+/**
+ * Generate JWT token
+ */
+const generateToken = (id) => {
+  return jwt.sign({ id }, process.env.JWT_SECRET, {
+    expiresIn: '30d'
+  });
+};
+
+/**
+ * Register a new user
+ * @route POST /api/users/register
+ * @access Public
+ */
+const registerUser = catchAsync(async (req, res) => {
+  const { email, password, firstName, lastName } = req.body;
+  
+  // Check if email already exists
+  const userExists = await User.findOne({ email });
+  
+  if (userExists) {
+    throw new ApiError(400, 'User with that email already exists');
+  }
+  
+  // Create new user
+  const user = new User({
+    email,
+    password,
+    profile: {
+      firstName,
+      lastName
+    }
+  });
+  
+  await user.save();
+  
+  // Send welcome email
+  await sendWelcomeEmail(email, firstName);
+  
+  // Generate token
+  const token = generateToken(user._id);
+  
+  res.status(201).json({
+    success: true,
+    data: {
+      id: user._id,
+      email: user.email,
+      profile: user.profile,
+      token
+    }
+  });
+});
+
+/**
+ * Login user
+ * @route POST /api/users/login
+ * @access Public
+ */
+const loginUser = catchAsync(async (req, res) => {
+  const { email, password } = req.body;
+  
+  // Find user by email
+  const user = await User.findOne({ email });
+  
+  if (!user) {
+    throw new ApiError(401, 'Invalid credentials');
+  }
+  
+  // Check password
+  const isMatch = await user.comparePassword(password);
+  
+  if (!isMatch) {
+    throw new ApiError(401, 'Invalid credentials');
+  }
+  
+  // Generate token
+  const token = generateToken(user._id);
+  
+  res.json({
+    success: true,
+    data: {
+      id: user._id,
+      email: user.email,
+      profile: user.profile,
+      preferences: user.preferences,
+      token
+    }
+  });
+});
+
+/**
+ * Get current user profile
+ * @route GET /api/users/profile
+ * @access Private
+ */
+const getUserProfile = catchAsync(async (req, res) => {
+  const user = await User.findById(req.user.id)
+    .select('-password -__v');
+  
+  if (!user) {
+    throw new ApiError(404, 'User not found');
+  }
+  
+  res.json({
+    success: true,
+    data: user
+  });
+});
+
+/**
+ * Update user profile
+ * @route PUT /api/users/profile
+ * @access Private
+ */
+const updateUserProfile = catchAsync(async (req, res) => {
+  const user = await User.findById(req.user.id);
+  
+  if (!user) {
+    throw new ApiError(404, 'User not found');
+  }
+  
+  // Update fields
+  if (req.body.firstName) {
+    user.profile.firstName = req.body.firstName;
+  }
+  
+  if (req.body.lastName) {
+    user.profile.lastName = req.body.lastName;
+  }
+  
+  if (req.body.email) {
+    // Check if email is already taken
+    const emailExists = await User.findOne({ email: req.body.email });
+    
+    if (emailExists && emailExists._id.toString() !== user._id.toString()) {
+      throw new ApiError(400, 'Email already in use');
+    }
+    
+    user.email = req.body.email;
+  }
+  
+  if (req.body.password) {
+    user.password = req.body.password;
+  }
+  
+  // Update preferences
+  if (req.body.preferences) {
+    const { preferences } = req.body;
+    
+    if (preferences.favoriteCategories) {
+      user.preferences.favoriteCategories = preferences.favoriteCategories;
+    }
+    
+    if (preferences.preferredRetailers) {
+      user.preferences.preferredRetailers = preferences.preferredRetailers;
+    }
+    
+    if (typeof preferences.darkMode === 'boolean') {
+      user.preferences.darkMode = preferences.darkMode;
+    }
+    
+    if (typeof preferences.emailNotifications === 'boolean') {
+      user.preferences.emailNotifications = preferences.emailNotifications;
+    }
+  }
+  
+  const updatedUser = await user.save();
+  
+  res.json({
+    success: true,
+    data: {
+      id: updatedUser._id,
+      email: updatedUser.email,
+      profile: updatedUser.profile,
+      preferences: updatedUser.preferences
+    }
+  });
+});
+
+/**
+ * Forgot password
+ * @route POST /api/users/forgot-password
+ * @access Public
+ */
+const forgotPassword = catchAsync(async (req, res) => {
+  const { email } = req.body;
+  
+  const user = await User.findOne({ email });
+  
+  if (!user) {
+    // Don't reveal that email doesn't exist
+    return res.json({
+      success: true,
+      message: 'If that email exists in our system, a reset link has been sent'
+    });
+  }
+  
+  // Generate reset token
+  const resetToken = crypto.randomBytes(32).toString('hex');
+  
+  // Hash the token and set to resetPasswordToken field
+  user.resetPasswordToken = crypto
+    .createHash('sha256')
+    .update(resetToken)
+    .digest('hex');
+  
+  // Set expiry to 1 hour
+  user.resetPasswordExpire = Date.now() + 60 * 60 * 1000;
+  
+  await user.save();
+  
+  // Send email with reset token
+  try {
+    await sendPasswordResetEmail(user.email, resetToken);
+    
+    res.json({
+      success: true,
+      message: 'If that email exists in our system, a reset link has been sent'
+    });
+  } catch (error) {
+    user.resetPasswordToken = undefined;
+    user.resetPasswordExpire = undefined;
+    await user.save();
+    
+    throw new ApiError(500, 'Email could not be sent');
+  }
+});
+
+/**
+ * Reset password
+ * @route PUT /api/users/reset-password/:resetToken
+ * @access Public
+ */
+const resetPassword = catchAsync(async (req, res) => {
+  // Get token from params
+  const { resetToken } = req.params;
+  const { password } = req.body;
+  
+  // Hash the token to compare with stored token
+  const hashedToken = crypto
+    .createHash('sha256')
+    .update(resetToken)
+    .digest('hex');
+  
+  // Find user with matching token and valid expiry time
+  const user = await User.findOne({
+    resetPasswordToken: hashedToken,
+    resetPasswordExpire: { $gt: Date.now() }
+  });
+  
+  if (!user) {
+    throw new ApiError(400, 'Invalid or expired token');
+  }
+  
+  // Set new password and clear reset fields
+  user.password = password;
+  user.resetPasswordToken = undefined;
+  user.resetPasswordExpire = undefined;
+  
+  await user.save();
+  
+  // Generate new JWT token
+  const token = generateToken(user._id);
+  
+  res.json({
+    success: true,
+    data: {
+      id: user._id,
+      email: user.email,
+      token
+    }
+  });
+});
+
+module.exports = {
+  registerUser,
+  loginUser,
+  getUserProfile,
+  updateUserProfile,
+  forgotPassword,
+  resetPassword
+};
+
+// controllers/alertController.js - Handler for price alert routes
+const alertService = require('../services/alertService');
+const catchAsync = require('../utils/catchAsync');
+
+/**
+ * Create a new price alert
+ * @route POST /api/alerts
+ * @access Private
+ */
+const createAlert = catchAsync(async (req, res) => {
+  const { productId, targetPrice } = req.body;
+  const userId = req.user.id;
+  
+  const alert = await alertService.createPriceAlert(userId, productId, targetPrice);
+  
+  res.status(201).json({
+    success: true,
+    data: alert
+  });
+});
+
+/**
+ * Get all alerts for the current user
+ * @route GET /api/alerts
+ * @access Private
+ */
+const getUserAlerts = catchAsync(async (req, res) => {
+  const userId = req.user.id;
+  
+  const alerts = await alertService.getUserAlerts(userId);
+  
+  res.json({
+    success: true,
+    data: alerts
+  });
+});
+
+/**
+ * Delete an alert
+ * @route DELETE /api/alerts/:id
+ * @access Private
+ */
+const deleteAlert = catchAsync(async (req, res) => {
+  const alertId = req.params.id;
+  const userId = req.user.id;
+  
+  await alertService.deleteAlert(alertId, userId);
+  
+  res.json({
+    success: true,
+    message: 'Alert deleted successfully'
+  });
+});
+
+module.exports = {
+  createAlert,
+  getUserAlerts,
+  deleteAlert
+};
+
+// routes/userRoutes.js - Route definitions for user endpoints
+const express = require('express');
+const router = express.Router();
+const userController = require('../controllers/userController');
+const { protect } = require('../middleware/authMiddleware');
+
+// Public routes
+router.post('/register', userController.registerUser);
+router.post('/login', userController.loginUser);
+router.post('/forgot-password', userController.forgotPassword);
+router.put('/reset-password/:resetToken', userController.resetPassword);
+
+// Protected routes
+router.get('/profile', protect, userController.getUserProfile);
+router.put('/profile', protect, userController.updateUserProfile);
+
+module.exports = router;
+
+// routes/alertRoutes.js - Route definitions for price alert endpoints
+const express = require('express');
+const router = express.Router();
+const alertController = require('../controllers/alertController');
+const { protect } = require('../middleware/authMiddleware');
+
+// All routes require authentication
+router.post('/', protect, alertController.createAlert);
+router.get('/', protect, alertController.getUserAlerts);
+router.delete('/:id', protect, alertController.deleteAlert);
+
+module.exports = router;
+
+// config/redis.js - Redis client configuration for caching
+const Redis = require('ioredis');
+const ApiError = require('../utils/ApiError');
+
+// Create Redis client instance
+const redisClient = new Redis({
+  host: process.env.REDIS_HOST || 'localhost',
+  port: process.env.REDIS_PORT || 6379,
+  password: process.env.REDIS_PASSWORD,
+  retryStrategy: (times) => {
+    const delay = Math.min(times * 50, 2000);
+    return delay;
+  }
+});
+
+// Handle Redis connection errors
+redisClient.on('error', (err) => {
+  console.error('Redis connection error:', err);
+  // Don't crash the app on Redis errors, just log them
+});
+
+// Handle Redis connection success
+redisClient.on('connect', () => {
+  console.log('Redis connected successfully');
+});
+
+module.exports = redisClient;
+
+// jobs/priceAlertJob.js - Scheduled job to process price alerts
+const alertService = require('../services/alertService');
+const cron = require('node-cron');
+
+// Schedule job to run every hour
+const scheduleAlertProcessing = () => {
+  cron.schedule('0 * * * *', async () => {
+    console.log('Running price alert check...');
+    try {
+      const triggeredAlerts = await alertService.processActiveAlerts();
+      console.log(`Price alert check complete. ${triggeredAlerts.length} alerts triggered.`);
+    } catch (error) {
+      console.error('Error processing price alerts:', error);
+    }
+  });
+  
+  console.log('Price alert job scheduled');
+};
+
+module.exports = { scheduleAlertProcessing };
+
+// jobs/dataSyncJob.js - Scheduled job to sync product data from retailers
+const Product = require('../models/Product');
+const productService = require('../services/productService');
+const cron = require('node-cron');
+
+// Schedule job to run every day at 2:00 AM
+const scheduleDataSync = () => {
+  cron.schedule('0 2 * * *', async () => {
+    console.log('Starting product data sync...');
+    
+    try {
+      // Get products that need updating (last updated > 24 hours ago)
+      const yesterday = new Date();
+      yesterday.setDate(yesterday.getDate() - 1);
+      
+      const outdatedProducts = await Product.find({
+        'metadata.lastUpdated': { $lt: yesterday }
+      }).limit(1000); // Process in batches
+      
+      console.log(`Found ${outdatedProducts.length} products to update`);
+      
+      let successCount = 0;
+      let errorCount = 0;
+      
+      // Update each product
+      for (const product of outdatedProducts) {
+        try {
+          await productService.refreshProductData(product._id);
+          successCount++;
+        } catch (error) {
+          console.error(`Error updating product ${product._id}:`, error);
+          errorCount++;
+        }
+        
+        // Add delay to avoid overwhelming external APIs
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      }
+      
+      console.log(`Product sync complete. Success: ${successCount}, Errors: ${errorCount}`);
+    } catch (error) {
+      console.error('Error in product sync job:', error);
+    }
+  });
+  
+  console.log('Product data sync job scheduled');
+};
+
+module.exports = { scheduleDataSync };
+
+// services/searchService.js - Service for search functionality
+const Product = require('../models/Product');
+const ApiError = require('../utils/ApiError');
+const redisClient = require('../config/redis');
+
+/**
+ * Get popular search queries
+ */
+const getPopularSearches = async (limit = 10) => {
+  try {
+    // Get top searches from Redis sorted set
+    const topSearches = await redisClient.zrevrange('popular_searches', 0, limit - 1, 'WITHSCORES');
+    
+    // Format results
+    const searches = [];
+    for (let i = 0; i < topSearches.length; i += 2) {
+      searches.push({
+        term: topSearches[i],
+        count: parseInt(topSearches[i + 1])
+      });
+    }
+    
+    return searches;
+  } catch (error) {
+    console.error('Error fetching popular searches:', error);
+    return [];
+  }
+};
+
+/**
+ * Track a search query to calculate popularity
+ */
+const trackSearchQuery = async (query) => {
+  try {
+    // Increment score in sorted set
+    await redisClient.zincrby('popular_searches', 1, query);
+  } catch (error) {
+    console.error('Error tracking search query:', error);
+  }
+};
+
+/**
+ * Get search suggestions based on partial input
+ */
+const getSearchSuggestions = async (partialQuery, limit = 5) => {
+  try {
+    if (!partialQuery || partialQuery.length < 2) {
+      return [];
+    }
+    
+    // Search for products matching the partial query
+    const products = await Product.find(
+      { $text: { $search: partialQuery } },
+      { score: { $meta: 'textScore' } }
+    )
+      .sort({ score: { $meta: 'textScore' } })
+      .limit(limit)
+      .select('name brand category');
+    
+    // Extract unique terms
+    const suggestions = products.map(product => product.name);
+    
+    // Remove duplicates
+    return [...new Set(suggestions)];
+  } catch (error) {
+    console.error('Error getting search suggestions:', error);
+    return [];
+  }
+};
+
+/**
+ * Get popular categories with product counts
+ */
+const getPopularCategories = async (limit = 10) => {
+  try {
+    // Get from cache if available
+    const cacheKey = `popular_categories:${limit}`;
+    const cachedCategories = await redisClient.get(cacheKey);
+    
+    if (cachedCategories) {
+      return JSON.parse(cachedCategories);
+    }
+    
+    // Aggregate product counts by category
+    const categories = await Product.aggregate([
+      { $group: { _id: '$category', count: { $sum: 1 } } },
+      { $sort: { count: -1 } },
+      { $limit: limit }
+    ]);
+    
+    const result = categories.map(cat => ({
+      name: cat._id,
+      count: cat.count
+    }));
+    
+    // Cache for 1 day
+    await redisClient.set(
+      cacheKey,
+      JSON.stringify(result),
+      'EX',
+      86400
+    );
+    
+    return result;
+  } catch (error) {
+    console.error('Error fetching popular categories:', error);
+    return [];
+  }
+};
+
+module.exports = {
+  getPopularSearches,
+  trackSearchQuery,
+  getSearchSuggestions,
+  getPopularCategories
+};
+
+// services/reviewService.js - Service for product reviews
+const Review = require('../models/Review');
+const Product = require('../models/Product');
+const ApiError = require('../utils/ApiError');
+
+/**
+ * Get reviews for a product
+ */
+const getProductReviews = async (productId, page = 1, limit = 10) => {
+  try {
+    const skip = (page - 
